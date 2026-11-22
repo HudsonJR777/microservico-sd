@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+media
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+env
+.venv
+db.sqlite3
+Dockerfile.test
+compose.parte1-teste.yml
+config/settings_parte1_teste.py
