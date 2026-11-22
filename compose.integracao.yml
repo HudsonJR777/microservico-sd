@@ -1,0 +1,66 @@
+# Ambiente descartável para RUN_P1_INTEGRATION do sistema principal.
+name: monografias-integracao
+x-ambiente: &ambiente
+  SECRET_KEY: ${P1_SECRET_KEY:?Defina P1_SECRET_KEY no ambiente}
+  JWT_SIGNING_KEY: ${P1_JWT_SIGNING_KEY:?Defina P1_JWT_SIGNING_KEY no ambiente}
+  DEBUG: "1"
+  ALLOWED_HOSTS: 127.0.0.1,localhost,testserver
+  DB_NAME: integracao
+  DB_USER: integracao
+  DB_PASSWORD: banco-descartavel-local
+  DB_HOST: db
+  REDIS_URL: redis://redis:6379/0
+  RABBITMQ_URL: amqp://teste:broker-descartavel-local@rabbitmq:5672/%2F
+  EXTRACOES_FILA: integracao.extracoes
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: integracao
+      POSTGRES_USER: integracao
+      POSTGRES_PASSWORD: banco-descartavel-local
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U integracao -d integracao"]
+      interval: 2s
+      retries: 30
+  redis:
+    image: redis:7-alpine
+  rabbitmq:
+    image: rabbitmq:4-management
+    environment:
+      RABBITMQ_DEFAULT_USER: teste
+      RABBITMQ_DEFAULT_PASS: broker-descartavel-local
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      retries: 30
+  web:
+    build: .
+    environment: *ambiente
+    command: sh -c "python manage.py migrate --noinput && python manage.py runserver 0.0.0.0:8000 --noreload"
+    ports:
+      - "127.0.0.1:8011:8000"
+    volumes:
+      - arquivos:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/', timeout=3)"]
+      interval: 3s
+      retries: 30
+  extractor:
+    build: .
+    environment: *ambiente
+    command: python manage.py processar_extracoes
+    volumes:
+      - arquivos:/app/media
+    depends_on:
+      web:
+        condition: service_healthy
+volumes:
+  arquivos:

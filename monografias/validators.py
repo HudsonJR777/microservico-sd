@@ -1,6 +1,7 @@
 import hashlib
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from pypdf import PdfReader
 
 
 def validar_pdf(arquivo):
@@ -15,6 +16,14 @@ def validar_pdf(arquivo):
     arquivo.seek(0)
     if cabecalho != b"%PDF-":
         raise ValidationError("O conteúdo do arquivo não é um PDF válido.")
+    try:
+        pdf = PdfReader(arquivo)
+        if pdf.is_encrypted or not pdf.pages:
+            raise ValueError('PDF vazio ou protegido.')
+    except Exception as exc:
+        raise ValidationError('Envie um PDF legível, com páginas e sem senha.') from exc
+    finally:
+        arquivo.seek(0)
 
 
 def calcular_sha256(arquivo):

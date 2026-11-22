@@ -4,3 +4,9 @@ __pycache__/
 *.pyc
 *.swp
 db.sqlite3
+
+.env.*
+!.env.example
+Dockerfile.test
+compose.parte1-teste.yml
+config/settings_parte1_teste.py

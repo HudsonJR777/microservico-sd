@@ -1,13 +1,15 @@
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.http import FileResponse
+from io import BytesIO
+import hashlib
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
 from . import services
-from .models import Monografia
+from .models import Monografia, ExtracaoPDF
 from .serializers import MonografiaSerializer
 from .throttles import SubmissaoThrottle
 
@@ -54,7 +56,10 @@ class MonografiaViewSet(viewsets.ModelViewSet):
             if self.professor_perfil_id is None:
                 return qs.none()
             return qs.filter(orientador_id=self.professor_perfil_id)
-        if self.papel in ("coordenador", "admin"):
+        if self.papel == "coordenador":
+            cursos = self._claim("curso_ids")
+            return qs.filter(curso_id__in=cursos) if isinstance(cursos, list) else qs.none()
+        if self.papel == "admin":
             return qs
         return qs.none()
 
@@ -102,11 +107,19 @@ class MonografiaViewSet(viewsets.ModelViewSet):
         if self.aluno_perfil_id is None:
             raise PermissionDenied("Token sem aluno_id.")
         origem = self.request.data.get('origem_id')
+        curso = self._claim('curso_id')
+        orientador = self._claim('orientador_id')
+        if not curso or not orientador:
+            raise PermissionDenied('Token sem os vínculos acadêmicos autorizados.')
+        if serializer.validated_data.get('curso_id') != curso or serializer.validated_data.get('orientador_id') != orientador:
+            raise PermissionDenied('Curso e orientador devem corresponder aos vínculos do token.')
         serializer.save(aluno_id=self.aluno_perfil_id,
                         **({'origem_id': int(origem)} if origem is not None else {}))
 
+    @transaction.atomic
     def perform_update(self, serializer):
-        self._exigir_papel("aluno", "coordenador", "admin")
+        self._exigir_papel("aluno")
+        serializer.instance = Monografia.objects.select_for_update().get(pk=serializer.instance.pk)
         if serializer.instance.origem_id is not None and (
             self.papel != 'aluno' or self._claim('scope') != 'integracao:origem'
         ):
@@ -115,14 +128,19 @@ class MonografiaViewSet(viewsets.ModelViewSet):
             raise PermissionDenied(
                 "Só é possível editar em rascunho ou quando o orientador pediu ajustes."
             )
+        for campo in ('curso_id', 'orientador_id'):
+            if campo in serializer.validated_data and serializer.validated_data[campo] != self._claim(campo):
+                raise PermissionDenied('Vínculo acadêmico divergente do token.')
         serializer.save()
 
+    @transaction.atomic
     def perform_destroy(self, instance):
-        self._exigir_papel("aluno", "coordenador", "admin")
+        self._exigir_papel("aluno")
+        instance = Monografia.objects.select_for_update().get(pk=instance.pk)
         if instance.origem_id is not None:
             raise PermissionDenied('A exclusao de monografias vinculadas nao e permitida neste servico.')
-        if instance.status == Monografia.Status.PUBLICADA:
-            raise PermissionDenied("Monografias publicadas não podem ser excluídas.")
+        if instance.status != Monografia.Status.RASCUNHO or instance.submetida_em:
+            raise PermissionDenied("Somente rascunhos nunca submetidos podem ser excluídos.")
         instance.delete()
 
     # --- ações do fluxo ---
@@ -135,6 +153,7 @@ class MonografiaViewSet(viewsets.ModelViewSet):
         if not arquivo:
             return Response({"erro": ["Envie o campo 'arquivo'."]}, status=400)
         erro = self._executar(services.anexar_arquivo, m, arquivo)
+        m.refresh_from_db()
         return erro or Response(self.get_serializer(m).data)
 
     @action(detail=True, methods=["post"], throttle_classes=[SubmissaoThrottle])
@@ -143,6 +162,7 @@ class MonografiaViewSet(viewsets.ModelViewSet):
         m = self.get_object()
         self._exigir_integracao(m)
         erro = self._executar(services.submeter, m)
+        m.refresh_from_db()
         return erro or Response(self.get_serializer(m).data)
 
     @action(detail=True, methods=["post"], url_path="aprovar-orientador")
@@ -153,6 +173,7 @@ class MonografiaViewSet(viewsets.ModelViewSet):
         m = self.get_object()
         self._exigir_integracao(m)
         erro = self._executar(services.aprovar_orientador, m, self.professor_perfil_id)
+        m.refresh_from_db()
         return erro or Response(self.get_serializer(m).data)
 
     @action(detail=True, methods=["post"], url_path="solicitar-ajustes")
@@ -166,6 +187,7 @@ class MonografiaViewSet(viewsets.ModelViewSet):
         erro = self._executar(
             services.solicitar_ajustes, m, self.professor_perfil_id, motivo
         )
+        m.refresh_from_db()
         return erro or Response(self.get_serializer(m).data)
 
     @action(detail=True, methods=["get"], url_path="verificar-integridade")
@@ -182,10 +204,23 @@ class MonografiaViewSet(viewsets.ModelViewSet):
         monografia = self.get_object()  # get_queryset limita aluno_id / professor_id
         if not monografia.arquivo:
             return Response({"erro": ["O PDF ainda nao foi enviado."]}, status=404)
+        with monografia.arquivo.open('rb') as arquivo:
+            conteudo = arquivo.read()
+        if hashlib.sha256(conteudo).hexdigest() != monografia.hash_sha256:
+            return Response({'erro': ['Integridade do PDF comprometida.']}, status=409)
         resposta = FileResponse(
-            monografia.arquivo.open("rb"), content_type="application/pdf",
+            BytesIO(conteudo), content_type="application/pdf",
             as_attachment=False, filename=f"monografia-{monografia.pk}.pdf",
         )
         resposta["X-Content-Type-Options"] = "nosniff"
         resposta["Cache-Control"] = "private, no-store"
         return resposta
+
+    @action(detail=True, methods=['get'], url_path='extracoes')
+    def extracoes(self, request, pk=None):
+        self._exigir_papel('aluno', 'orientador')
+        m = self.get_object()
+        # Índices privados; nunca expor caminhos físicos do armazenamento.
+        registros = m.extracoes.order_by('-criado_em').values(
+            'id', 'sha256', 'criado_em', 'processado_em', 'sem_texto', 'falhas', 'ultimo_erro', 'texto')
+        return Response({'versoes': list(registros)})

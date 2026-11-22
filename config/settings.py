@@ -24,6 +24,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "config.rede.RedeAdministrativaMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -111,3 +112,8 @@ SIMPLE_JWT = {
     "ALGORITHM": "HS256",
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
 }
+
+EXTRACOES_FILA = os.environ.get('EXTRACOES_FILA', 'monografias.extrair')
+EXTRACOES_MAX_TENTATIVAS = 3
+EXTRACOES_MAX_TEXTO = 1000000
+ADMIN_ALLOWED_NETWORKS = os.environ.get('ADMIN_ALLOWED_NETWORKS', '127.0.0.1/32,::1/128').split(',')

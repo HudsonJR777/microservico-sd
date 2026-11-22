@@ -5,11 +5,10 @@ from django.db import transaction
 from django.utils import timezone
 
 from .messaging.publisher import publicar
-from .models import Monografia
+from .models import Monografia, ExtracaoPDF
 from .validators import calcular_sha256, validar_pdf
 
 S = Monografia.Status
-LOCK_TTL = 600  # segundos
 
 
 class RegraDeNegocio(Exception):
@@ -29,7 +28,9 @@ def _payload(m, **extra):
     return dados
 
 
+@transaction.atomic
 def anexar_arquivo(m: Monografia, arquivo):
+    m = Monografia.objects.select_for_update().get(pk=m.pk)
     if m.status not in Monografia.EDITAVEIS:
         raise RegraDeNegocio(
             "Só é possível enviar arquivo em rascunho ou quando o orientador pediu ajustes."
@@ -44,16 +45,17 @@ def anexar_arquivo(m: Monografia, arquivo):
     m.save()
 
 
+@transaction.atomic
 def submeter(m: Monografia):
+    m = Monografia.objects.select_for_update().get(pk=m.pk)
     if m.status not in Monografia.EDITAVEIS:
         raise RegraDeNegocio(
             "Apenas rascunhos ou monografias com ajustes solicitados podem ser submetidas."
         )
     if not m.arquivo:
         raise RegraDeNegocio("Envie o PDF antes de submeter.")
-    # add() só grava se a chave não existir (equivale a SET NX)
-    if not cache.add(f"upload_em_andamento:{m.pk}", 1, LOCK_TTL):
-        raise RegraDeNegocio("Esta monografia já está em processamento.")
+    # O lock transacional da monografia serializa submissões. O índice tem
+    # versão própria; não bloqueia reenvios enquanto aguarda o consumidor.
 
     with transaction.atomic():
         m.status = S.SUBMETIDA
@@ -61,10 +63,7 @@ def submeter(m: Monografia):
         m.aprovada_orientador_em = None
         m.submetida_em = timezone.now()
         m.save()
-        payload = _payload(
-            m, titulo=m.titulo, hash_sha256=m.hash_sha256, arquivo=m.arquivo.name
-        )
-        transaction.on_commit(lambda: publicar("monografia.submetida", payload))
+        ExtracaoPDF.objects.create(monografia=m, arquivo_nome=m.arquivo.name, sha256=m.hash_sha256)
 
 
 def _checar_orientador_em_analise(m: Monografia, professor_id: int):
@@ -74,7 +73,11 @@ def _checar_orientador_em_analise(m: Monografia, professor_id: int):
         raise RegraDeNegocio("A monografia não está aguardando análise do orientador.")
 
 
+@transaction.atomic
 def aprovar_orientador(m: Monografia, professor_id: int):
+    m = Monografia.objects.select_for_update().get(pk=m.pk)
+    if not verificar_integridade(m):
+        raise RegraDeNegocio("O PDF diverge do SHA-256 registrado; aprovação bloqueada.")
     _checar_orientador_em_analise(m, professor_id)
     with transaction.atomic():
         m.status = S.APROVADA_ORIENTADOR
@@ -85,7 +88,9 @@ def aprovar_orientador(m: Monografia, professor_id: int):
         transaction.on_commit(lambda: publicar("monografia.aprovada_orientador", payload))
 
 
+@transaction.atomic
 def solicitar_ajustes(m: Monografia, professor_id: int, motivo: str = ""):
+    m = Monografia.objects.select_for_update().get(pk=m.pk)
     _checar_orientador_em_analise(m, professor_id)
     with transaction.atomic():
         m.status = S.AJUSTES_SOLICITADOS
