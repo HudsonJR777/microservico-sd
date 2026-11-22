@@ -1,3 +1,5 @@
+import uuid
+from django.utils import timezone
 from django.db import models
 from simple_history.models import HistoricalRecords
 
@@ -78,3 +80,22 @@ class DocumentoComplementar(models.Model):
     criado_em = models.DateTimeField(auto_now_add=True)
 
     history = HistoricalRecords()
+
+class ExtracaoPDF(models.Model):
+    """Versão imutável de uma submissão e outbox de extração privada."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    monografia = models.ForeignKey(Monografia, on_delete=models.PROTECT, related_name='extracoes')
+    arquivo_nome = models.CharField(max_length=500)
+    sha256 = models.CharField(max_length=64)
+    texto = models.TextField(blank=True)
+    sem_texto = models.BooleanField(default=False)
+    criado_em = models.DateTimeField(default=timezone.now)
+    enviado_em = models.DateTimeField(null=True, blank=True)
+    processado_em = models.DateTimeField(null=True, blank=True)
+    proxima_tentativa = models.DateTimeField(default=timezone.now, db_index=True)
+    tentativas_envio = models.PositiveIntegerField(default=0)
+    falhas = models.PositiveIntegerField(default=0)
+    ultimo_erro = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        ordering = ['criado_em', 'pk']

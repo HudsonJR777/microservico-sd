@@ -65,6 +65,20 @@ services:
       rabbitmq:
         condition: service_healthy
 
+  extractor:
+    build: .
+    command: python manage.py processar_extracoes
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - .:/app
+      - media:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
 volumes:
   pgdata:
   media:

@@ -10,3 +10,5 @@ pika
 gunicorn
 pytest
 pytest-django
+
+pypdf==6.21.4
