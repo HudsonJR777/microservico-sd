@@ -26,6 +26,7 @@ class Monografia(models.Model):
 
     # Referências a outros serviços: apenas IDs (e nomes copiados para exibição)
     aluno_id = models.PositiveIntegerField(db_index=True)
+    origem_id = models.PositiveIntegerField(null=True, blank=True, unique=True, db_index=True)
     aluno_nome = models.CharField(max_length=200, blank=True)
     orientador_id = models.PositiveIntegerField(db_index=True)
     orientador_nome = models.CharField(max_length=200, blank=True)

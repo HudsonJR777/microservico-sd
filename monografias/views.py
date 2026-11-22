@@ -1,4 +1,6 @@
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
+from django.http import FileResponse
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
@@ -38,6 +40,10 @@ class MonografiaViewSet(viewsets.ModelViewSet):
         if self.papel not in papeis:
             raise PermissionDenied("Seu papel não permite esta ação.")
 
+    def _exigir_integracao(self, monografia):
+        if monografia.origem_id is not None and self._claim('scope') != 'integracao:origem':
+            raise PermissionDenied('Acoes em monografias vinculadas exigem a integracao com o principal.')
+
     def get_queryset(self):
         qs = Monografia.objects.all().order_by("-criado_em")
         if self.papel == "aluno":
@@ -61,15 +67,50 @@ class MonografiaViewSet(viewsets.ModelViewSet):
         return None
 
     # --- CRUD ---
+    def create(self, request, *args, **kwargs):
+        origem = request.data.get('origem_id')
+        if origem is not None:
+            # Somente a ponte servidor-servidor emite JWT com esse escopo.
+            if self.papel != 'aluno' or self._claim('scope') != 'integracao:origem':
+                raise PermissionDenied('Somente a integracao pode vincular IDs de origem.')
+            try:
+                origem = int(origem)
+                if origem <= 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                return Response({'erro': ['ID de origem invalido.']}, status=400)
+            existente = Monografia.objects.filter(origem_id=origem).first()
+            if existente is not None:
+                if existente.aluno_id != self.aluno_perfil_id:
+                    raise PermissionDenied('Este vinculo ja pertence a outro aluno.')
+                return Response(self.get_serializer(existente).data, status=200)
+        if origem is None:
+            return super().create(request, *args, **kwargs)
+        # Duas tentativas simultaneas com mesma origem nao criam registros duplicados.
+        try:
+            with transaction.atomic():
+                return super().create(request, *args, **kwargs)
+        except IntegrityError:
+            existente = Monografia.objects.filter(origem_id=origem).first()
+            if existente is not None and existente.aluno_id == self.aluno_perfil_id:
+                return Response(self.get_serializer(existente).data, status=200)
+            raise PermissionDenied('O vinculo de origem nao esta disponivel.')
+
     def perform_create(self, serializer):
         if self.papel != "aluno":
             raise PermissionDenied("Apenas alunos criam monografias.")
         if self.aluno_perfil_id is None:
             raise PermissionDenied("Token sem aluno_id.")
-        serializer.save(aluno_id=self.aluno_perfil_id)
+        origem = self.request.data.get('origem_id')
+        serializer.save(aluno_id=self.aluno_perfil_id,
+                        **({'origem_id': int(origem)} if origem is not None else {}))
 
     def perform_update(self, serializer):
         self._exigir_papel("aluno", "coordenador", "admin")
+        if serializer.instance.origem_id is not None and (
+            self.papel != 'aluno' or self._claim('scope') != 'integracao:origem'
+        ):
+            raise PermissionDenied('Edicao de monografia vinculada exige a integracao.')
         if serializer.instance.status not in Monografia.EDITAVEIS:
             raise PermissionDenied(
                 "Só é possível editar em rascunho ou quando o orientador pediu ajustes."
@@ -78,6 +119,8 @@ class MonografiaViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         self._exigir_papel("aluno", "coordenador", "admin")
+        if instance.origem_id is not None:
+            raise PermissionDenied('A exclusao de monografias vinculadas nao e permitida neste servico.')
         if instance.status == Monografia.Status.PUBLICADA:
             raise PermissionDenied("Monografias publicadas não podem ser excluídas.")
         instance.delete()
@@ -87,6 +130,7 @@ class MonografiaViewSet(viewsets.ModelViewSet):
     def upload(self, request, pk=None):
         self._exigir_papel("aluno")
         m = self.get_object()
+        self._exigir_integracao(m)
         arquivo = request.FILES.get("arquivo")
         if not arquivo:
             return Response({"erro": ["Envie o campo 'arquivo'."]}, status=400)
@@ -97,6 +141,7 @@ class MonografiaViewSet(viewsets.ModelViewSet):
     def submeter(self, request, pk=None):
         self._exigir_papel("aluno")
         m = self.get_object()
+        self._exigir_integracao(m)
         erro = self._executar(services.submeter, m)
         return erro or Response(self.get_serializer(m).data)
 
@@ -106,6 +151,7 @@ class MonografiaViewSet(viewsets.ModelViewSet):
         if self.professor_perfil_id is None:
             raise PermissionDenied("Token sem professor_id.")
         m = self.get_object()
+        self._exigir_integracao(m)
         erro = self._executar(services.aprovar_orientador, m, self.professor_perfil_id)
         return erro or Response(self.get_serializer(m).data)
 
@@ -115,6 +161,7 @@ class MonografiaViewSet(viewsets.ModelViewSet):
         if self.professor_perfil_id is None:
             raise PermissionDenied("Token sem professor_id.")
         m = self.get_object()
+        self._exigir_integracao(m)
         motivo = str(request.data.get("motivo", ""))[:500]
         erro = self._executar(
             services.solicitar_ajustes, m, self.professor_perfil_id, motivo
@@ -126,3 +173,19 @@ class MonografiaViewSet(viewsets.ModelViewSet):
         m = self.get_object()
         return Response({"integro": services.verificar_integridade(m),
                          "hash_armazenado": m.hash_sha256})
+
+
+    @action(detail=True, methods=["get"], url_path="baixar-pdf")
+    def baixar_pdf(self, request, pk=None):
+        """Download privado apenas para o aluno dono ou o orientador vinculado."""
+        self._exigir_papel("aluno", "orientador")
+        monografia = self.get_object()  # get_queryset limita aluno_id / professor_id
+        if not monografia.arquivo:
+            return Response({"erro": ["O PDF ainda nao foi enviado."]}, status=404)
+        resposta = FileResponse(
+            monografia.arquivo.open("rb"), content_type="application/pdf",
+            as_attachment=False, filename=f"monografia-{monografia.pk}.pdf",
+        )
+        resposta["X-Content-Type-Options"] = "nosniff"
+        resposta["Cache-Control"] = "private, no-store"
+        return resposta
